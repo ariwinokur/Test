@@ -1,0 +1,159 @@
+import streamlit as st
+import pandas as pd
+import os
+import folium
+from streamlit_folium import st_folium
+from geopy.geocoders import Nominatim
+from geopy.extra.rate_limiter import RateLimiter
+import time
+
+st.set_page_config(page_title="Location Collector", page_icon="🌍", layout="wide")
+
+st.title("🌍 Location Collector")
+st.markdown("Help build a list of all represented cities and states! Enter your info below.")
+st.markdown("*City is optional — leave it blank if you just want to represent your state.*")
+
+# File to store data
+DATA_FILE = "locations.csv"
+
+# Initialize geocoder (Nominatim is free, no API key needed)
+geolocator = Nominatim(user_agent="location_collector_app")
+geocode = RateLimiter(geolocator.geocode, min_delay_seconds=1)  # Respect rate limits
+
+# Load data
+@st.cache_data
+def load_data():
+    if os.path.exists(DATA_FILE):
+        return pd.read_csv(DATA_FILE)
+    else:
+        return pd.DataFrame(columns=["Name", "City", "State"])
+
+# Save data
+def save_data(df):
+    df.to_csv(DATA_FILE, index=False)
+
+# Add new entry
+def add_entry(name, city, state):
+    df = load_data()
+    city = city.strip() if city else ""
+    new_row = pd.DataFrame({"Name": [name], "City": [city], "State": [state.upper()]})
+    df = pd.concat([df, new_row], ignore_index=True)
+    save_data(df)
+    st.cache_data.clear()  # Refresh data
+    return df
+
+# Create display location string
+def create_location_string(row):
+    city = row['City'].strip() if pd.notna(row['City']) and row['City'].strip() else ""
+    state = row['State'].upper()
+    if city:
+        return f"{city}, {state}"
+    else:
+        return state
+
+# Get unique locations with coordinates
+@st.cache_data(ttl=3600)  # Cache for 1 hour to reduce geocoding calls
+def get_unique_locations_with_coords():
+    df = load_data()
+    if df.empty:
+        return pd.DataFrame()
+    
+    df_copy = df.copy()
+    df_copy["Location"] = df_copy.apply(create_location_string, axis=1)
+    unique_df = df_copy[["Location", "City", "State"]].drop_duplicates().reset_index(drop=True)
+    
+    # Add lat/lon
+    unique_df["query"] = unique_df.apply(
+        lambda row: f"{row['City']}, {row['State']}, USA" if row['City'] else f"{row['State']}, USA",
+        axis=1
+    )
+    
+    unique_df["location_obj"] = unique_df["query"].apply(geocode)
+    unique_df["lat"] = unique_df["location_obj"].apply(lambda loc: loc.latitude if loc else None)
+    unique_df["lon"] = unique_df["location_obj"].apply(lambda loc: loc.longitude if loc else None)
+    
+    # Drop failed geocodes (rare, but possible)
+    unique_df = unique_df.dropna(subset=["lat", "lon"])
+    
+    return unique_df[["Location", "lat", "lon"]]
+
+# Sidebar form
+with st.sidebar:
+    st.header("✍️ Add Your Location")
+    with st.form(key="add_form"):
+        name = st.text_input("Your Name *", help="Required")
+        city = st.text_input("City (optional)", help="Leave blank to represent the whole state")
+        state = st.text_input("State * (e.g., CA, New York, Texas)", max_chars=30, help="Required")
+        submitted = st.form_submit_button("Submit")
+
+        if submitted:
+            name = name.strip()
+            city = city.strip()
+            state = state.strip()
+
+            if not name:
+                st.error("Please enter your name!")
+            elif not state:
+                st.error("Please enter your state!")
+            else:
+                add_entry(name, city, state)
+                display_city = city if city else "(whole state)"
+                st.success(f"Thank you, {name.split()[0]}! You've added {display_city} of {state.upper()}.")
+                st.balloons()
+                time.sleep(1)
+                st.rerun()  # Refresh to show updated map immediately
+
+# Main content: Map first
+st.markdown("### 🗺️ Live Map of Represented Locations")
+
+locations_df = get_unique_locations_with_coords()
+
+if not locations_df.empty:
+    # Calculate center
+    center_lat = locations_df["lat"].mean()
+    center_lon = locations_df["lon"].mean()
+
+    # Create map
+    m = folium.Map(location=[center_lat, center_lon], zoom_start=4, tiles="OpenStreetMap")
+
+    # Add marker cluster for better performance
+    from folium.plugins import MarkerCluster
+    marker_cluster = MarkerCluster().add_to(m)
+
+    for _, row in locations_df.iterrows():
+        folium.Marker(
+            location=[row["lat"], row["lon"]],
+            popup=folium.Popup(row["Location"], max_width=300),
+            tooltip=row["Location"],
+            icon=folium.Icon(color="blue", icon="map-pin", prefix="fa")
+        ).add_to(marker_cluster)
+
+    # Fit bounds to all markers
+    m.fit_bounds(marker_cluster.get_bounds())
+
+    # Display map (full width)
+    st_folium(m, width=1200, height=600, returned_objects=[])
+    
+    st.write(f"**{len(locations_df)} unique location(s) represented**")
+else:
+    st.info("No locations added yet. Be the first one! The map will appear here once entries are submitted.")
+
+# List of locations below map
+st.markdown("### 📍 List of Unique Represented Locations")
+locations_list = sorted(locations_df["Location"].tolist()) if not locations_df.empty else []
+
+if locations_list:
+    cols = st.columns(3)
+    for i, loc in enumerate(locations_list):
+        cols[i % 3].write(f"• {loc}")
+else:
+    st.info("No locations yet.")
+
+# Total contributions
+df = load_data()
+if not df.empty:
+    st.markdown(f"---\n**Total contributions:** {len(df)} people have participated.")
+
+# Footer
+st.markdown("---")
+st.caption("Made with ❤️ using Streamlit • Live map powered by Folium • Geocoding via OpenStreetMap (Nominatim)")
